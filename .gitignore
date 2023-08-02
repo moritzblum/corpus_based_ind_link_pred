@@ -1,0 +1,5 @@
+.idea
+/data
+/code/.ipynb_checkpoints
+/code/wandb
+.DS_Store

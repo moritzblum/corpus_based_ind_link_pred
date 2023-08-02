@@ -1,0 +1,6 @@
+pandas==2.0.2
+notebook==6.5.4
+tqdm
+pykeen
+matplotlib
+seaborn
