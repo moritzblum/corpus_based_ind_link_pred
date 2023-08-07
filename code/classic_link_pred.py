@@ -10,7 +10,8 @@ import sklearn
 from numpy.random import choice
 from torch_geometric.loader import DataListLoader
 from torch_geometric.nn import DataParallel
-from torch_geometric.utils import k_hop_subgraph, subgraph, add_self_loops
+from torch_geometric.transforms import RemoveDuplicatedEdges
+from torch_geometric.utils import k_hop_subgraph, subgraph, add_self_loops, to_undirected
 
 import wandb
 import os.path as osp
@@ -61,9 +62,18 @@ def negative_sampling(edge_index, num_nodes, eta=50, in_batch_negatives=False):
             DEVICE)
         neg_edge_index[mask_2, 1] = torch.from_numpy(choice(a=in_batch_entities, size=(1, mask_2.sum().cpu()))).to(
             DEVICE)
+    elif SAMPLE:
+        all_entities = torch.unique(TRAIN_EDGE_INDEX).cpu().numpy()
+        neg_edge_index[mask_1, 0] = torch.from_numpy(choice(a=all_entities, size=(1, mask_1.sum().cpu()))).to(
+            DEVICE)
+        neg_edge_index[mask_2, 1] = torch.from_numpy(choice(a=all_entities, size=(1, mask_2.sum().cpu()))).to(
+            DEVICE)
     else:
         neg_edge_index[mask_1, 0] = torch.randint(num_nodes, (1, mask_1.sum()), device=DEVICE)
         neg_edge_index[mask_2, 1] = torch.randint(num_nodes, (1, mask_2.sum()), device=DEVICE)
+
+
+
 
     return neg_edge_index
 
@@ -227,7 +237,6 @@ def get_relevant_neighbors(graph, train_graph, node_features, selection_method='
 
     if selection_method == SEMANTIC_RELEVANCE_REDUNDANCY:
         print('Selecting neighbors by semantic similarity and avoiding redundancy.')
-        # todo implement selection_method == SEMANTIC_RELEVANCE_REDUNDANCY
         return {}
 
     raise Exception('Neighborhood selection strategy does not exist:', selection_method)
@@ -243,7 +252,6 @@ def read_entity_features(fusion, description_embeddings, node_neighbors, triples
 
     if fusion == POOLING or fusion == CNN:
         print('Apply pooling over entity neighborhood.')
-        # todo print entity neighborhood and check if this is reasonable
         entity_features_pooled = torch.zeros_like(description_embeddings)
         for head, tails in tqdm(node_neighbors.items()):
 
@@ -286,10 +294,6 @@ def read_entity_features(fusion, description_embeddings, node_neighbors, triples
             x_relation_input = torch.load(RELATION_FEATURES_CLUSTER_PATH)
             x_relation_entity = torch.zeros((entity_features.size(0), x_relation_input.size(1)))
 
-            # for id in uri_to_id.values():
-            #    if id not in entity_relations_dict.keys():
-            #        print(id in test_entitites)
-
             print('Pooling relation features from one-hot encoding.')
             for head, relations in tqdm(entity_relations_dict.items()):
                 relations_unique = list(set(relations))
@@ -328,85 +332,100 @@ def read_entity_features(fusion, description_embeddings, node_neighbors, triples
 
 def train_standard_lp(eta=50):
     model.train()
-    start = time.time()
 
-    train_edge_index_t = data_train.edge_index.t().to(DEVICE)
-    train_edge_type = data_train.edge_type.to(DEVICE)
-
-    edge_index_batches = torch.split(train_edge_index_t, BS)
-    edge_type_batches = torch.split(train_edge_type, BS)
+    edge_index_batches = torch.split(TRAIN_EDGE_INDEX.t(), BS)
+    edge_type_batches = torch.split(TRAIN_EDGE_TYPE, BS)
 
     indices = np.arange(len(edge_index_batches))
     np.random.shuffle(indices)
 
     loss_total = 0
-    for iss in tqdm(torch.split(torch.tensor(indices), 1)):  # todo try same as batch size
-        ds = []  # todo rename reasonable
-        for i in iss:
-            edge_idxs, relation_idx = edge_index_batches[i], edge_type_batches[i]
-            optimizer.zero_grad()
+    for i in tqdm(torch.tensor(indices)):
+        optimizer.zero_grad()
 
-            # todo for gcn compute negative samples based on the already given entities to speed up the computation
-            edge_idxs_neg = negative_sampling(edge_idxs, len(uri_to_id.keys()), eta=eta,
-                                              in_batch_negatives=IN_BATCH_NEGATIVES)
+        edge_idxs, relation_idx = edge_index_batches[i], edge_type_batches[i]
 
-            #out_pos = model.forward(edge_idxs[:, 0], relation_idx, edge_idxs[:, 1])
-            #out_neg = model.forward(edge_idxs_neg[:, 0], relation_idx.repeat(eta), edge_idxs_neg[:, 1])
+        edge_idxs_neg = negative_sampling(edge_idxs, len(uri_to_id.keys()), eta=eta,
+                                          in_batch_negatives=IN_BATCH_NEGATIVES)
 
-            heads = torch.cat([edge_idxs[:, 0], edge_idxs_neg[:, 0]], dim=0)
-            rels = torch.cat([relation_idx, relation_idx.repeat(eta)])
-            tails = torch.cat([edge_idxs[:, 1], edge_idxs_neg[:, 1]], dim=0)
+        heads = torch.cat([edge_idxs[:, 0], edge_idxs_neg[:, 0]], dim=0)
+        rels = torch.cat([relation_idx, relation_idx.repeat(eta)])
+        tails = torch.cat([edge_idxs[:, 1], edge_idxs_neg[:, 1]], dim=0)
 
-            # todo all data operations from the model should be placed here
-            #start = time.time()
-            # returns an empty edge_index if no GCN
-            neighborhood_edge_index = get_batch_neighborhood(heads, tails, train_edge_index_t, train_edge_type)
+        neighborhood_edge_index = get_batch_neighborhood_graph(heads, tails)
+        # x is just a placeholder to fulfill the Data requirements
+        batch_data = Data(x=torch.zeros((10,10)), edge_type=rels, edge_index=torch.stack([heads, tails], dim=0), edge_index_neighborhood=neighborhood_edge_index)
+        out = model.forward(batch_data)
+        gt = torch.cat([torch.ones(len(relation_idx)), torch.zeros(len(relation_idx) * eta)], dim=0).to(DEVICE)
 
-            gt = torch.cat([torch.ones(len(relation_idx)), torch.zeros(len(relation_idx) * eta)], dim=0)
-            batch_data = Data(x=torch.zeros((10,10)), edge_index_neighborhood=neighborhood_edge_index, edge_type=rels, edge_index=torch.stack([heads, tails], dim=0), gt=gt)
-            ds.append(batch_data)
+        loss = loss_function(out, gt)
+        loss.backward()
+        loss_total += loss.item()
+        optimizer.step()
 
-        loader = DataListLoader(ds, batch_size=1, shuffle=False)
-        for l in loader:
-            out = model.forward(l)
-
-            gt = torch.cat([data.gt for data in l]).to(out.device)
-            loss = loss_function(out, gt)
-
-            loss.backward()
-            loss_total += loss.item()
-            optimizer.step()
-    end = time.time()
-    print('elapsed time:', end - start)
-    print('loss:', loss_total / len(edge_index_batches))
+    print('loss:', loss_total / TRAIN_EDGE_INDEX.size(1))
 
 
-def get_batch_neighborhood(heads, tails, train_edge_index_t, train_edge_type):
-    edge_index = torch.tensor([])
+def get_batch_neighborhood_graph(heads, tails):
+    edge_index_sample = torch.tensor([])
     if FUSION == GCN:
         batch_entities = torch.unique(torch.cat([heads, tails])).to(DEVICE)
-        _, edge_index, _, _ = k_hop_subgraph(batch_entities, 1, neighborhood_graphs, relabel_nodes=False,
-                                             flow="target_to_source")
+        #print('batch_entities', batch_entities.size())
+
+        _, edge_index_sample, _, _ = k_hop_subgraph(batch_entities, 1, NEIGHBORHOOD_GRAPHS, relabel_nodes=False, flow=FLOW, directed=True)
+        #print('edge_index_sample', edge_index_sample.size())  # todo debugging
+
+        edge_index_sample = TRANSFORM(Data(x=torch.zeros((10, 10)), edge_index=edge_index_sample)).edge_index
+        #print('edge_index_sample after transform', edge_index_sample.size())  # todo debugging
+
 
         if INCLUDE_TRAIN_GRAPH_CONTEXT:
-            relevant_entities = torch.unique(edge_index).to(DEVICE)
+            relevant_entities = torch.unique(edge_index_sample).to(DEVICE)
             induced_subgraph_edge_index, induced_subgraph_edge_type = subgraph(relevant_entities,
-                                                                               train_edge_index_t.t(), train_edge_type)
-            edge_index = torch.cat((edge_index, induced_subgraph_edge_index), dim=1)# .to(DEVICE) todo
-        edge_index, _ = add_self_loops(edge_index)
-    return edge_index
+                                                                               TRAIN_EDGE_INDEX, TRAIN_EDGE_TYPE)
+
+            edge_index_sample = torch.cat((edge_index_sample, induced_subgraph_edge_index), dim=1)
+
+        # add reverse edges
+        # todo removed for debugging
+        edge_index_sample = to_undirected(edge_index_sample)
+
+    return edge_index_sample
+
+
+def in_k_hop(head, tail):
+    _, edge_index_k_hop_head, _, _ = k_hop_subgraph(torch.tensor([head]), 1, ALL_UNDIRECTED_EDGE_INDEX, relabel_nodes=False)
+    _, edge_index_k_hop_tail, _, _ = k_hop_subgraph(torch.tensor([tail]), 1, ALL_UNDIRECTED_EDGE_INDEX, relabel_nodes=False)
+
+    if len(np.intersect1d(torch.unique(edge_index_k_hop_head).cpu(), torch.unique(edge_index_k_hop_tail).cpu())):
+        print('in neighborhood:', head, tail)
+        return True
+    else:
+        return False
+
+
+def apply_re_ranking(heads, tails, out, alpha=0.05):
+    print('start re_ranking')
+    alphas = torch.ones_like(heads)
+    for i in tqdm(range(heads.size(0))):
+        if in_k_hop(heads[i], tails[i]):
+            alphas[i] = 1 + alpha
+
+    alphas = alphas.to(DEVICE)
+    out_re_ranked = out.detach().clone()
+    out_re_ranked = out_re_ranked * alphas
+
+    return out_re_ranked
 
 
 @torch.no_grad()
 def compute_mrr_triple_scoring(model, eval_edge_index, eval_edge_type,
                                fast=False, split='train'):
+
     model.eval()
     ranks = []
-    num_samples = eval_edge_type.numel() if not fast else 1000
-
-    train_edge_index_t = data_train.edge_index.t().to(DEVICE)
-    train_edge_type = data_train.edge_type.to(DEVICE)
-    parallel_batch_size = 2
+    ranks_re_ranked = []
+    num_samples = eval_edge_type.numel() if not fast else min(1000, eval_edge_type.numel())
 
     for triple_index in tqdm(range(num_samples)):
         (src, dst), rel = eval_edge_index[:, triple_index], eval_edge_type[triple_index]
@@ -432,36 +451,30 @@ def compute_mrr_triple_scoring(model, eval_edge_index, eval_edge_type,
             tail_mask[data_test.edge_index[1]] = False
 
         tail = torch.arange(len(uri_to_id.keys()))[tail_mask]
-        tail = torch.cat([torch.tensor([dst]), tail])#.to(DEVICE) todo
-        head = torch.full_like(tail, fill_value=src)#.to(DEVICE) todo
-        eval_edge_typ_tensor = torch.full_like(tail, fill_value=rel)# .to(DEVICE) todo
+        tail = torch.cat([torch.tensor([dst]), tail]).to(DEVICE)
+        head = torch.full_like(tail, fill_value=src).to(DEVICE)
+        eval_edge_typ_tensor = torch.full_like(tail, fill_value=rel).to(DEVICE)
 
-        start = time.time()
         out = []
-        ds = []
-        for head_batch, eval_edge_typ_tensor_batch, tail_batch in zip(torch.split(head, BS),
-                                                                      torch.split(eval_edge_typ_tensor, BS),
-                                                                      torch.split(tail, BS)):
+        for head_batch, eval_edge_typ_tensor_batch, tail_batch in zip(torch.split(head, BS_EVAL),
+                                                                      torch.split(eval_edge_typ_tensor, BS_EVAL),
+                                                                      torch.split(tail, BS_EVAL)):
 
-            # todo put data preparation here
-            neighborhood_edge_index = get_batch_neighborhood(head_batch, tail_batch, train_edge_index_t, train_edge_type)
+            neighborhood_edge_index = get_batch_neighborhood_graph(head_batch, tail_batch)
 
-            batch_data = Data(x=torch.zeros((10, 10)), edge_index_neighborhood=neighborhood_edge_index, edge_type=eval_edge_typ_tensor_batch,
+            batch_data = Data(x=torch.zeros((10, 10)),
+                              edge_index_neighborhood=neighborhood_edge_index,
+                              edge_type=eval_edge_typ_tensor_batch,
                               edge_index=torch.stack([head_batch, tail_batch], dim=0))
-            ds.append(batch_data)
-        print('Prepare data:', time.time() - start)
-        start = time.time()
-        loader = DataListLoader(ds, batch_size=parallel_batch_size, shuffle=False)
-        for l in loader:
-            out_batch = model.forward(l).detach().cpu()
-            # todo make use of data parallel
-            #out_batch = model.forward([batch_data]).detach().cpu()
-            out.append(out_batch)
-        out = torch.cat(out)
-        print('Forward:', time.time() - start)
 
-        rank = compute_rank(out)
-        ranks.append(rank)
+            out_batch = model.forward(batch_data).detach().cpu()
+            out.append(out_batch)
+
+        out = torch.cat(out)
+        ranks.append(compute_rank(out))
+        if RE_RANK:
+            out_re_ranked = apply_re_ranking(head, tail, out, alpha=0.05)
+            ranks_re_ranked.append(compute_rank(out_re_ranked))
 
         # Try all nodes as heads, but delete true triplets:
         head_mask = torch.ones(len(uri_to_id.keys()), dtype=torch.bool)
@@ -484,48 +497,49 @@ def compute_mrr_triple_scoring(model, eval_edge_index, eval_edge_type,
             head_mask[data_test.edge_index[1]] = False
 
         head = torch.arange(len(uri_to_id.keys()))[head_mask]
-        head = torch.cat([torch.tensor([src]), head])# .to(DEVICE)todo
-        tail = torch.full_like(head, fill_value=dst)# .to(DEVICE) todo
-        eval_edge_typ_tensor = torch.full_like(head, fill_value=rel)# .to(DEVICE) todo
+        head = torch.cat([torch.tensor([src]), head]).to(DEVICE)
+        tail = torch.full_like(head, fill_value=dst).to(DEVICE)
+        eval_edge_typ_tensor = torch.full_like(head, fill_value=rel).to(DEVICE)
 
         out = []
-        ds = []
-        for head_batch, eval_edge_typ_tensor_batch, tail_batch in zip(torch.split(head, BS),
-                                                                      torch.split(eval_edge_typ_tensor, BS),
-                                                                      torch.split(tail, BS)):
-            # todo put data preparation here
-            neighborhood_edge_index = get_batch_neighborhood(head_batch, tail_batch, train_edge_index_t,
-                                                             train_edge_type)
+        for head_batch, eval_edge_typ_tensor_batch, tail_batch in zip(torch.split(head, BS_EVAL),
+                                                                      torch.split(eval_edge_typ_tensor, BS_EVAL),
+                                                                      torch.split(tail, BS_EVAL)):
 
-            batch_data = Data(x=torch.zeros((10, 10)), edge_index_neighborhood=neighborhood_edge_index,
+            neighborhood_edge_index = get_batch_neighborhood_graph(head_batch, tail_batch)
+
+            batch_data = Data(x=torch.zeros((10, 10)),
+                              edge_index_neighborhood=neighborhood_edge_index,
                               edge_type=eval_edge_typ_tensor_batch,
                               edge_index=torch.stack([head_batch, tail_batch], dim=0))
-            ds.append(batch_data)
 
-        loader = DataListLoader(ds, batch_size=parallel_batch_size, shuffle=False)
-        for l in loader:
-            out_batch = model.forward(l).detach().cpu()
-            # todo make use of data parallel
-            # out_batch = model.forward([batch_data]).detach().cpu()
+            out_batch = model.forward(batch_data).detach().cpu()
             out.append(out_batch)
-        out = torch.cat(out)
 
-        rank = compute_rank(out).detach().cpu()
-        ranks.append(rank)
+        out = torch.cat(out)
+        ranks.append(compute_rank(out))
+        if RE_RANK:
+            out_re_ranked = apply_re_ranking(head, tail, out, alpha=0.05)
+            ranks_re_ranked.append(compute_rank(out_re_ranked))
 
     num_ranks = len(ranks)
     ranks = torch.tensor(ranks, dtype=torch.float)
 
-    return (1. / ranks).mean().item(), \
-           ranks.mean().item(), \
-           ranks[ranks <= 10].size(0) / num_ranks, \
-           ranks[ranks <= 5].size(0) / num_ranks, \
-           ranks[ranks <= 3].size(0) / num_ranks, \
-           ranks[ranks <= 1].size(0) / num_ranks
+    scores = [(1. / ranks).mean().item(), ranks.mean().item(), ranks[ranks <= 10].size(0) / num_ranks, ranks[ranks <= 5].size(0) / num_ranks, ranks[ranks <= 3].size(0) / num_ranks, ranks[ranks <= 1].size(0) / num_ranks]
+    #mrr, mr, hits10, hits5, hits3, hits1 = scores
+    #print(f'{split} mrr:', mrr, 'mr:', mr, 'hits@10:', hits10, 'hits@5:', hits5, 'hits@3:', hits3, 'hits@1:', hits1)
+
+    if RE_RANK:
+        ranks_re_ranked = torch.tensor(ranks_re_ranked, dtype=torch.float)
+        scores_re_ranked = [(1. / ranks_re_ranked).mean().item(), ranks_re_ranked.mean().item(), ranks_re_ranked[ranks_re_ranked <= 10].size(0) / num_ranks, ranks_re_ranked[ranks_re_ranked <= 5].size(0) / num_ranks, ranks_re_ranked[ranks_re_ranked <= 3].size(0) / num_ranks, ranks_re_ranked[ranks_re_ranked <= 1].size(0) / num_ranks]
+        mrr, mr, hits10, hits5, hits3, hits1 = scores_re_ranked
+        print(f'{split} re_ranked mrr:', mrr, 'mr:', mr, 'hits@10:', hits10, 'hits@5:', hits5, 'hits@3:', hits3, 'hits@1:', hits1)
+
+    return scores
 
 
 if __name__ == '__main__':
-    DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # The following files will not be derived and have to be given:
     # ENTITY_FEATURES_PATH, PAGE_LINK_GRAPH_PATH, ENTITY_2_ID_FILE, RELATION_2_ID_FILE, RELATION_FEATURES_DESC,
@@ -559,30 +573,31 @@ if __name__ == '__main__':
     DEBUG = 'debug'
 
     parser = argparse.ArgumentParser(description='feature based link prediction')
-    # todo implement evaluation to load and evaluate a specified model
     parser.add_argument('--mode', type=str, default="", help="debug avoids creating wandb logs, continue loads the specified model file and continues training ")
     parser.add_argument('--lr', type=float, default=.001, help="learning rate")
     parser.add_argument('--bs', type=int, default=1000, help="batch size")
+    parser.add_argument('--bs_eval', type=int, default=1000, help="batch size")
     parser.add_argument('--hidden', type=int, default=500, help="hidden dim")
     parser.add_argument('--epochs', type=int, default=100, help="epochs for training")
     parser.add_argument('--model', type=str, default="", help="model path")
     parser.add_argument('--features', type=str, default="", help="model path")
     parser.add_argument('--eta', type=int, default=50, help="number of false triples to generate per true triple")
-    # todo implement rgcn
     parser.add_argument('--fusion', type=str, default="pooling", help="method to fuse node description features: no, zeros, pooling, cnn, gcn, rgcn")
     parser.add_argument('--selection', type=str, default="random", help="method to select neighbors: no, random, degree, tfidf_relevance, semantic_relevance, semantic_relevance_redundancy")
     parser.add_argument('--num_neighbors', type=int, default=5, help="number of neighbors selected as additional features")
     parser.add_argument('--additional_features', type=str, default="no", help="additional node features added after the neighborhood selection and feature processing like pooling: no, edge_type, edge_embedding")
     parser.add_argument('--cores', type=int, default=10, help="number ob CPU cores that can be used")
     parser.add_argument('--scheduler_start', type=int, default=25, help="after how many epochs to start the learning rate scheduler (if you like no scheduler, set this to -1)")
-    # todo outdated as this seems to have no effect
-    parser.add_argument('--num_linear_layers', type=int, default=1, help="")
     parser.add_argument('--num_gcn_layers', type=int, default=1, help="number of GCN or R-GCN layers applied in the decoder")
     parser.add_argument('--clean', default=False, action='store_true', help="remove feature and model files from drive")
     parser.add_argument('--in_batch_negatives', default=False, action='store_true', help="generate negative samples by random sampling nodes from the batch instead of sampling from the whole graph")
-    # todo implement to only connect entities in the local neighborhoods and not between neighborhoods
     parser.add_argument('--include_train_graph_context', default=False, action='store_true', help="add edges from the train graph connecting entitiets in the neighborhood graph and between neighborhood graphs")
     parser.add_argument('--comment', type=str, default="", help="use for custom specifications implemented directly in code")
+    parser.add_argument('--flow', type=str, default="target_to_source", help="target_to_source, source_to_target")
+    parser.add_argument('--re_rank', default=False, action='store_true', help="re-ranking like described in SimKGC")
+    # todo sample must restrict the neighbors in order to work with gcn, otherwise all entities would still be available
+    parser.add_argument('--sample', default=False, action='store_true', help="use a small sample dataset")
+
 
     args = parser.parse_args()
     torch.set_num_threads(args.cores)
@@ -597,19 +612,23 @@ if __name__ == '__main__':
     ADDITIONAL_FEATURES = args.additional_features
     MODE = args.mode
     SCHEDULER_START = args.scheduler_start
-    NUM_LINEAR_LAYERS = args.num_linear_layers
     NUM_GCN_LAYERS = args.num_gcn_layers
     COMMENT = args.comment
     CNN_MODE = FUSION == CNN
     IN_BATCH_NEGATIVES = args.in_batch_negatives
     INCLUDE_TRAIN_GRAPH_CONTEXT = args.include_train_graph_context
+    BS_EVAL = args.bs_eval
+    CLEAN = args.clean
+    FLOW = args.flow
+    RE_RANK = args.re_rank
+    SAMPLE = args.sample
 
     FEATURES_FILE = args.features if args.features != '' else 'features_' + '_'.join(
         [FUSION, SELECTION, str(NUM_NEIGHBORS), ADDITIONAL_FEATURES]) + '.pt'
     FEATURES_PATH = osp.join(DATA_PATH, FEATURES_FILE)
 
     MODEL_FILE = args.model if args.model != '' else 'model_' + '_'.join(
-        [FUSION, SELECTION, str(NUM_NEIGHBORS), ADDITIONAL_FEATURES, str(NUM_LINEAR_LAYERS),
+        [FUSION, SELECTION, str(NUM_NEIGHBORS), ADDITIONAL_FEATURES,
          str(NUM_GCN_LAYERS)]) + '.pt'
     MODEL_PATH = osp.join(DATA_PATH, MODEL_FILE)
 
@@ -627,30 +646,28 @@ if __name__ == '__main__':
         "HIDDEN_DIM": HIDDEN_DIM,
         "ETA": ETA,
         "SCHEDULER_START": SCHEDULER_START,
-        "NUM_LINEAR_LAYERS": NUM_LINEAR_LAYERS,
         "NUM_GCN_LAYERS": NUM_GCN_LAYERS,
         "IN_BATCH_NEGATIVES": IN_BATCH_NEGATIVES,
         "INCLUDE_TRAIN_GRAPH_CONTEXT": INCLUDE_TRAIN_GRAPH_CONTEXT,
-        "comment": COMMENT
+        "COMMENT": COMMENT,
+        "FLOW": FLOW
     }
 
-    print(f"Let's use {torch.cuda.device_count()} GPUs!")
+    print(f"Using {torch.cuda.device_count()} GPUs!")
     print('--- config ---')
     for key, value in config.items():
         print(key, '=', value)
 
     if MODE != DEBUG:
-        run = wandb.init(
-            # Set the project where this run will be logged
-            project="cbilp_pool",
-            # Track hyperparameters and run metadata
-            config=config)
+        run = wandb.init(project="cbilp_pool", config=config)
 
     with open(ENTITY_2_ID_PATH) as uri_to_id_in:
         uri_to_id = json.load(uri_to_id_in)
 
     with open(RELATION_2_ID_PATH) as uri_to_id_in:
         relation_uri_to_id = json.load(uri_to_id_in)
+
+    TRANSFORM = RemoveDuplicatedEdges()
 
     print('Start preprocessing LP dataset.')
     if not os.path.isfile(f'../data/wikidata5m_inductive/train.pt'):
@@ -667,10 +684,19 @@ if __name__ == '__main__':
         torch.save(data_val, '../data/wikidata5m_inductive/test.pt')
 
     start = time.time()
-    data_train = torch.load(f'../data/wikidata5m_inductive/train.pt')
-    data_val = torch.load(f'../data/wikidata5m_inductive/val.pt')
-    data_test = torch.load(f'../data/wikidata5m_inductive/test.pt')
-    print('Loaded LP dataset:', time.time() - start)
+    if SAMPLE:
+        data_train = torch.load(f'../data/wikidata5m_inductive/train_sample.pt')
+        data_val = torch.load(f'../data/wikidata5m_inductive/val_sample.pt')
+        data_test = torch.load(f'../data/wikidata5m_inductive/test_sample.pt')
+        print('Loaded sampled LP dataset:', time.time() - start)
+    else:
+        data_train = torch.load(f'../data/wikidata5m_inductive/train.pt')
+        data_val = torch.load(f'../data/wikidata5m_inductive/val.pt')
+        data_test = torch.load(f'../data/wikidata5m_inductive/test.pt')
+        print('Loaded LP dataset:', time.time() - start)
+
+    TRAIN_EDGE_INDEX = data_train.edge_index.to(DEVICE)
+    TRAIN_EDGE_TYPE = data_train.edge_type.to(DEVICE)
 
     if not osp.exists(FEATURES_PATH):
         start = time.time()
@@ -698,20 +724,14 @@ if __name__ == '__main__':
 
         if FUSION == GCN and not osp.isfile(NEIGHBORHOOD_GRAPHS_PATH):
             print('Start deriving neighborhood graphs for GCN.')
-            neighborhood_graphs = []
+            NEIGHBORHOOD_GRAPHS = []
             for entity_idx in tqdm(range(len(uri_to_id.keys()))):
                 tails = neighbors[entity_idx]
-                neighborhood_graphs.append(torch.tensor([[entity_idx for _ in tails], tails]).int())
-                neighborhood_graphs.append(torch.tensor([[entity_idx], [entity_idx]]))
+                NEIGHBORHOOD_GRAPHS.append(torch.tensor([[entity_idx for _ in tails], tails]).int())
+                #NEIGHBORHOOD_GRAPHS.append(torch.tensor([[entity_idx], [entity_idx]]))
 
-            neighborhood_graphs = torch.cat(neighborhood_graphs, dim=1)
-            torch.save(neighborhood_graphs, NEIGHBORHOOD_GRAPHS_PATH)
-            """
-            if FUSION == RGCN:
-                # todo implement neighborhood graph that contains edge labels
-    
-                pass
-            """
+            NEIGHBORHOOD_GRAPHS = torch.cat(NEIGHBORHOOD_GRAPHS, dim=1)
+            torch.save(NEIGHBORHOOD_GRAPHS, NEIGHBORHOOD_GRAPHS_PATH)
             print('Derived neighborhood graphs.')
             print('Derivation of all features:', time.time() - start)
 
@@ -723,28 +743,35 @@ if __name__ == '__main__':
 
     if FUSION == GCN:
         print('Start loading neighborhood graphs for GCN.')
-        neighborhood_graphs = torch.load(NEIGHBORHOOD_GRAPHS_PATH).to(DEVICE)
-        #print('before model', neighborhood_graphs.size())
-        model = DistMultNet(EMBEDDING_DIM, len(relation_uri_to_id.keys()), HIDDEN_DIM, x,
-                            neighborhood_graphs, train_graph=data_train,
-                            include_train_graph_context=INCLUDE_TRAIN_GRAPH_CONTEXT, device=DEVICE, gcn='gcn',
-                            num_linear_layers=NUM_LINEAR_LAYERS, num_gcn_layers=NUM_GCN_LAYERS, cnn=False, bs=BS)
-        model = DataParallel(model)
-        """
-        elif FUSION == RGCN:
-        print('Start loading neighborhood graphs for R-GCN.')
-        neighborhood_graphs = torch.load(NEIGHBORHOOD_GRAPHS_PATH)
-        model = DistMultNet(EMBEDDING_DIM, len(relation_uri_to_id.keys()), HIDDEN_DIM, x,
-                            neighborhood_graphs, DEVICE, gcn='rgcn', num_linear_layers=NUM_LINEAR_LAYERS, num_gcn_layers=NUM_GCN_LAYERS, cnn=False, bs=BS)
-        """
+        NEIGHBORHOOD_GRAPHS = torch.load(NEIGHBORHOOD_GRAPHS_PATH)
+        NEIGHBORHOOD_GRAPHS, _ = add_self_loops(NEIGHBORHOOD_GRAPHS, num_nodes=x.size(0))
+        NEIGHBORHOOD_GRAPHS = NEIGHBORHOOD_GRAPHS.type(torch.int64).to(DEVICE)
+
+        model = DistMultNet(EMBEDDING_DIM, len(relation_uri_to_id.keys()), HIDDEN_DIM, x, device=DEVICE, gcn='gcn', bs=BS, num_gcn_layers=NUM_GCN_LAYERS)
+
     else:
-        model = DistMultNet(EMBEDDING_DIM, len(relation_uri_to_id.keys()), HIDDEN_DIM, x, [], train_graph=data_train, include_train_graph_context=INCLUDE_TRAIN_GRAPH_CONTEXT,
-                            device=DEVICE, gcn='no', num_linear_layers=NUM_LINEAR_LAYERS, cnn=CNN_MODE, bs=BS)
+        model = DistMultNet(EMBEDDING_DIM, len(relation_uri_to_id.keys()), HIDDEN_DIM, x, device=DEVICE, gcn='no', bs=BS)
+
+    if RE_RANK:
+        # load page link graph
+        if osp.isfile(INDUCTIVE_PAGE_LINK_GRAPH_PATH):
+            PAGE_LINK_GRAPH = torch.load(INDUCTIVE_PAGE_LINK_GRAPH_PATH)
+        else:
+            print('File {INDUCTIVE_PAGE_LINK_GRAPH_PATH} foes not exist. Please run data pre-processing to create it. ')
+            exit(0)
+
+        PAGE_LINK_GRAPH_EDGE_INDEX = TRANSFORM(Data(x=torch.zeros(10,10), edge_index=torch.stack([PAGE_LINK_GRAPH[:,0], PAGE_LINK_GRAPH[:,2]]))).edge_index
+        ALL_UNDIRECTED_EDGE_INDEX = to_undirected(torch.cat([TRAIN_EDGE_INDEX, data_val.edge_index.to(DEVICE), data_test.edge_index.to(DEVICE), PAGE_LINK_GRAPH_EDGE_INDEX.to(DEVICE)], dim=1).to(DEVICE))
 
     model = model.to(DEVICE)
     print('Model is set-up, start training.')
 
+    if MODE == CONTINUE:
+        print('Load pre-trained model')
+        model.load_state_dict(torch.load(MODEL_PATH))
+
     if not os.path.isfile(MODEL_PATH) or MODE == CONTINUE or True:
+        print('Start training.')
         loss_function = torch.nn.BCELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
@@ -753,27 +780,27 @@ if __name__ == '__main__':
                                               total_iters=EPOCHS - SCHEDULER_START)
         model.train()
 
-        for epoch in tqdm(range(0, EPOCHS)):  # to evaluation (move back to 1)
-            #train_standard_lp(ETA) # todo test evaluation
+        for epoch in tqdm(range(1, EPOCHS + 1)):
+            train_standard_lp(ETA)
             print(f'Save model weights after {epoch} epochs:', MODEL_PATH)
-            #torch.save(model.state_dict(), MODEL_PATH)  # todo test evaluation
+            torch.save(model.state_dict(), MODEL_PATH)
 
             if epoch > SCHEDULER_START and SCHEDULER_START >= 0:
                 scheduler.step()
 
             if epoch % 5 == 0:
                 model.x = x
+
                 mrr, mr, hits10, hits5, hits3, hits1 = compute_mrr_triple_scoring(model,
                                                                                   data_val.edge_index,
                                                                                   data_val.edge_type,
                                                                                   fast=True,
                                                                                   split='val')
+
                 if MODE != 'debug':
                     wandb.log({"mrr": mrr, "mr": mr, "hits10": hits10, "hits5": hits5, "hits3": hits3, "hits1": hits1})
                 print('val mrr:', mrr, 'mr:', mr, 'hits@10:', hits10, 'hits@5:', hits5, 'hits@3:', hits3, 'hits@1:',
                       hits1)
-    else:
-        model.load_state_dict(torch.load(MODEL_PATH))
 
     print('--- Final Evaluation ---')
     print('train')
@@ -783,7 +810,8 @@ if __name__ == '__main__':
     print('test')
     compute_mrr_triple_scoring(model, data_test.edge_index, data_test.edge_type, fast=True, split='test')
 
-    print('Start cleaning up data.')
-    if osp.exists(FEATURES_PATH): os.remove(FEATURES_PATH)
-    if osp.exists(MODEL_PATH): os.remove(MODEL_PATH)
-    if osp.exists(NEIGHBORHOOD_GRAPHS_PATH): os.remove(NEIGHBORHOOD_GRAPHS_PATH)
+    if CLEAN:
+        print('Start cleaning up data.')
+        if osp.exists(FEATURES_PATH): os.remove(FEATURES_PATH)
+        if osp.exists(MODEL_PATH): os.remove(MODEL_PATH)
+        if osp.exists(NEIGHBORHOOD_GRAPHS_PATH): os.remove(NEIGHBORHOOD_GRAPHS_PATH)

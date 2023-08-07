@@ -16,3 +16,16 @@ of Inductive Link Prediction.
 
 
 
+### Files and Data Formats
+
+* Page Link Graphs (`PAGE_LINK_GRAPH_PATH` & `INDUCTIVE_PAGE_LINK_GRAPH_PATH`) are stored as triples instead of `edge_index` and `edge_type`.
+`PAGE_LINK_GRAPH_PATH` can be created by using `entity_linking.ipynb` for entity linking and `classic_link_pred.py` for classifying the link.
+
+
+### ToDos
+* implement re-ranking s.t. not the whole page link graph is used, instead only the page link graph of the inductive entities (as no re-ranking is done for the train entities anyway)
+* implement to only connect entities in the local neighborhoods of a triple and not between neighborhoods not of the triple
+* remove CNN code
+
+
+
